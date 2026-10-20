@@ -2,13 +2,12 @@ from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 import cv2
 import numpy as np
-from skimage.metrics import structural_similarity as ssim
 import imagehash
 from PIL import Image
 import tempfile
 import os
 
-VERSION = "v2.1.0"
+VERSION = "v2.2.0"
 app = FastAPI(title="Video Analyzer")
 
 def isolate_product(img):
@@ -47,11 +46,11 @@ def isolate_product(img):
     return img[int(h*0.15):int(h*0.85), int(w*0.1):int(w*0.9)]
 
 def compute_orb_score(img1, img2):
-    """ORB feature matching score"""
+    """ORB feature matching for style"""
     gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
     gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
     
-    orb = cv2.ORB_create(nfeatures=400)
+    orb = cv2.ORB_create(nfeatures=500)
     kp1, des1 = orb.detectAndCompute(gray1, None)
     kp2, des2 = orb.detectAndCompute(gray2, None)
     
@@ -65,13 +64,32 @@ def compute_orb_score(img1, img2):
         return 0.0
     
     matches = sorted(matches, key=lambda x: x.distance)
-    good = [m for m in matches if m.distance < 55]
+    good = [m for m in matches if m.distance < 60]
     
-    score = min(1.0, len(good) / 25.0)
+    score = min(1.0, len(good) / 20.0)
     return float(score)
 
+def compute_edge_score(img1, img2):
+    """Edge-based style comparison"""
+    gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+    gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+    
+    # Canny edges
+    edges1 = cv2.Canny(gray1, 40, 120)
+    edges2 = cv2.Canny(gray2, 40, 120)
+    
+    # Compare edge maps
+    intersection = np.logical_and(edges1 > 0, edges2 > 0).sum()
+    union = np.logical_or(edges1 > 0, edges2 > 0).sum()
+    
+    if union == 0:
+        return 0.0
+    
+    iou = intersection / union
+    return float(min(1.0, iou * 2.5))  # boost
+
 def compute_hash_score(img1, img2):
-    """Perceptual hash similarity"""
+    """Perceptual hash"""
     def to_pil(cv_img):
         rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
         return Image.fromarray(rgb)
@@ -84,7 +102,7 @@ def compute_hash_score(img1, img2):
     return max(0.0, float(score))
 
 def compute_metrics(frame, ref):
-    """Combined ORB + Hash + Color"""
+    """Style-focused: ORB + Edges + Hash"""
     frame_prod = isolate_product(frame)
     ref_prod = isolate_product(ref)
     
@@ -93,27 +111,24 @@ def compute_metrics(frame, ref):
     ref_r = cv2.resize(ref_prod, size, interpolation=cv2.INTER_AREA)
     
     orb_score = compute_orb_score(frame_r, ref_r)
+    edge_score = compute_edge_score(frame_r, ref_r)
     hash_score = compute_hash_score(frame_r, ref_r)
     
-    hist1 = cv2.calcHist([frame_r], [0,1,2], None, [8,8,8], [0,256]*3)
-    hist2 = cv2.calcHist([ref_r], [0,1,2], None, [8,8,8], [0,256]*3)
+    # Light color check (secondary)
+    hist1 = cv2.calcHist([frame_r], [0,1,2], None, [6,6,6], [0,256]*3)
+    hist2 = cv2.calcHist([ref_r], [0,1,2], None, [6,6,6], [0,256]*3)
     cv2.normalize(hist1, hist1, 0, 1, cv2.NORM_MINMAX)
     cv2.normalize(hist2, hist2, 0, 1, cv2.NORM_MINMAX)
-    hist_corr = max(0.0, float(cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)))
+    color_score = max(0.0, float(cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)))
     
-    gray1 = cv2.cvtColor(frame_r, cv2.COLOR_BGR2GRAY)
-    gray2 = cv2.cvtColor(ref_r, cv2.COLOR_BGR2GRAY)
-    diff = cv2.absdiff(gray1, gray2)
-    _, thresh = cv2.threshold(diff, 45, 255, cv2.THRESH_BINARY)
-    diff_percent = float(np.sum(thresh > 0) / thresh.size * 100)
-    
-    combined = (orb_score * 0.40) + (hash_score * 0.35) + (hist_corr * 0.25)
+    # Style-focused weights: ORB 45%, Edges 30%, Hash 15%, Color 10%
+    combined = (orb_score * 0.45) + (edge_score * 0.30) + (hash_score * 0.15) + (color_score * 0.10)
     
     return {
         "orb": round(orb_score * 100, 1),
+        "edge": round(edge_score * 100, 1),
         "hash": round(hash_score * 100, 1),
-        "color": round(hist_corr * 100, 1),
-        "diff_percent": round(diff_percent, 1),
+        "color": round(color_score * 100, 1),
         "combined": round(combined * 100, 1)
     }
 
@@ -228,7 +243,7 @@ async def home():
         .overall-label {{ color: #94a3b8; font-size: 0.95rem; margin-top: 4px; }}
         .metrics {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
             gap: 12px;
             margin: 20px 0;
         }}
@@ -239,7 +254,7 @@ async def home():
             text-align: center;
             border: 1px solid #334155;
         }}
-        .metric-card .value {{ font-size: 1.5rem; font-weight: 700; color: #60a5fa; }}
+        .metric-card .value {{ font-size: 1.4rem; font-weight: 700; color: #60a5fa; }}
         .metric-card .label {{ font-size: 0.7rem; color: #94a3b8; margin-top: 4px; }}
         .verdict {{
             padding: 16px;
@@ -252,8 +267,8 @@ async def home():
         .verdict.high {{ background: #065f46; color: #6ee7b7; }}
         .verdict.mid {{ background: #854d0e; color: #fde047; }}
         .verdict.low {{ background: #7f1d1d; color: #fca5a5; }}
-        table {{ width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 0.8rem; }}
-        th, td {{ padding: 8px 10px; text-align: left; border-bottom: 1px solid #334155; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 0.78rem; }}
+        th, td {{ padding: 8px 8px; text-align: left; border-bottom: 1px solid #334155; }}
         th {{ color: #94a3b8; font-weight: 500; }}
         .error {{ color: #f87171; background: #7f1d1d; padding: 12px; border-radius: 8px; }}
         .note {{
@@ -273,7 +288,7 @@ async def home():
             <h1>Video Analyzer</h1>
             <span class="version">{VERSION}</span>
         </div>
-        <p class="subtitle">ORB + ImageHash + Color matching. Scores shown as percentages.</p>
+        <p class="subtitle">Style-focused matching: ORB (shape) + Edges + Hash. Less dependent on color.</p>
         
         <div class="card">
             <form id="form">
@@ -305,7 +320,7 @@ async def home():
         e.preventDefault();
         const result = document.getElementById('result');
         result.style.display = 'block';
-        result.innerHTML = '<p style="text-align:center; color:#94a3b8;">Analyzing with ORB + Hash... 15-45 seconds</p>';
+        result.innerHTML = '<p style="text-align:center; color:#94a3b8;">Analyzing style... 15-45 seconds</p>';
         
         const formData = new FormData(e.target);
         try {{
@@ -322,28 +337,28 @@ async def home():
             else if (data.overall_score < 30) verdictClass = 'low';
             
             let rows = data.details.map(d => 
-                `<tr><td>${{d.time}}</td><td>${{d.orb}}%</td><td>${{d.hash}}%</td><td>${{d.color}}%</td><td>${{d.diff_percent}}%</td><td><strong>${{d.combined}}%</strong></td></tr>`
+                `<tr><td>${{d.time}}</td><td>${{d.orb}}%</td><td>${{d.edge}}%</td><td>${{d.hash}}%</td><td>${{d.color}}%</td><td><strong>${{d.combined}}%</strong></td></tr>`
             ).join('');
             
             result.innerHTML = `
                 <div class="overall">
                     <div class="overall-score">${{data.overall_score}}%</div>
-                    <div class="overall-label">Overall Product Score</div>
+                    <div class="overall-label">Overall Style Score</div>
                 </div>
                 <div class="verdict ${{verdictClass}}">${{data.verdict}}</div>
                 <div class="metrics">
-                    <div class="metric-card"><div class="value">${{data.avg_orb}}%</div><div class="label">ORB</div></div>
+                    <div class="metric-card"><div class="value">${{data.avg_orb}}%</div><div class="label">ORB Style</div></div>
+                    <div class="metric-card"><div class="value">${{data.avg_edge}}%</div><div class="label">Edges</div></div>
                     <div class="metric-card"><div class="value">${{data.avg_hash}}%</div><div class="label">Hash</div></div>
                     <div class="metric-card"><div class="value">${{data.avg_color}}%</div><div class="label">Color</div></div>
-                    <div class="metric-card"><div class="value">${{data.avg_diff}}%</div><div class="label">Diff</div></div>
                     <div class="metric-card"><div class="value">${{data.low_percent}}%</div><div class="label">Flagged</div></div>
                 </div>
                 <div class="note">
-                    <strong>v2.1:</strong> Scores are now shown as percentages. ORB + ImageHash + Color matching.
+                    <strong>v2.2 Style Focus:</strong> 45% ORB (shape features) + 30% Edges + 15% Hash + 10% Color.
                 </div>
                 <h3 style="margin: 20px 0 8px; color:#cbd5e1;">Frame Details</h3>
                 <table>
-                    <thead><tr><th>Time</th><th>ORB</th><th>Hash</th><th>Color</th><th>Diff %</th><th>Score</th></tr></thead>
+                    <thead><tr><th>Time</th><th>ORB</th><th>Edge</th><th>Hash</th><th>Color</th><th>Score</th></tr></thead>
                     <tbody>${{rows}}</tbody>
                 </table>
             `;
@@ -389,9 +404,9 @@ async def analyze(
         details = []
         combined_scores = []
         orb_scores = []
+        edge_scores = []
         hash_scores = []
         color_scores = []
-        diff_percents = []
         frame_idx = 0
         max_samples = 35
         
@@ -408,16 +423,16 @@ async def analyze(
                 details.append({
                     "time": time_str,
                     "orb": metrics["orb"],
+                    "edge": metrics["edge"],
                     "hash": metrics["hash"],
                     "color": metrics["color"],
-                    "diff_percent": metrics["diff_percent"],
                     "combined": metrics["combined"]
                 })
                 combined_scores.append(metrics["combined"])
                 orb_scores.append(metrics["orb"])
+                edge_scores.append(metrics["edge"])
                 hash_scores.append(metrics["hash"])
                 color_scores.append(metrics["color"])
-                diff_percents.append(metrics["diff_percent"])
             
             frame_idx += 1
         
@@ -432,26 +447,25 @@ async def analyze(
         
         scores = np.array(combined_scores)
         overall = float(np.mean(scores))
-        avg_diff = float(np.mean(diff_percents))
         low_count = sum(1 for s in combined_scores if s < threshold)
         
         if overall >= 55:
-            verdict = "GOOD MATCH — product features align"
+            verdict = "GOOD STYLE MATCH — product shape aligns"
         elif overall >= 38:
-            verdict = "MODERATE MATCH — similar product"
+            verdict = "MODERATE MATCH — similar style"
         elif overall >= 25:
-            verdict = "PARTIAL MATCH — some similarities"
+            verdict = "PARTIAL MATCH — some style similarities"
         else:
-            verdict = "POOR MATCH — different product"
+            verdict = "POOR MATCH — different style"
         
         return {
             "overall_score": round(overall, 1),
             "avg_orb": round(float(np.mean(orb_scores)), 1),
+            "avg_edge": round(float(np.mean(edge_scores)), 1),
             "avg_hash": round(float(np.mean(hash_scores)), 1),
             "avg_color": round(float(np.mean(color_scores)), 1),
             "min_combined": round(float(np.min(scores)), 1),
             "max_combined": round(float(np.max(scores)), 1),
-            "avg_diff": round(avg_diff, 1),
             "low_percent": round(100 * low_count / len(combined_scores), 1),
             "verdict": verdict,
             "details": details,
