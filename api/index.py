@@ -6,78 +6,92 @@ from skimage.metrics import structural_similarity as ssim
 import tempfile
 import os
 
-VERSION = "v1.8.0"
+VERSION = "v1.9.0"
 app = FastAPI(title="Video Analyzer")
 
 def isolate_product(img):
-    """Isolate light-colored product (shoes) from background"""
+    """Isolate light product with broader color range"""
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     
-    # Light colors (white, cream, beige products)
-    lower = np.array([0, 0, 140])
-    upper = np.array([180, 80, 255])
+    # Broader light color range
+    lower = np.array([0, 0, 120])
+    upper = np.array([180, 100, 255])
     mask = cv2.inRange(hsv, lower, upper)
     
-    # Clean mask
-    kernel = np.ones((5,5), np.uint8)
+    kernel = np.ones((7,7), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     
-    # Find largest contour (main product)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if contours:
-        largest = max(contours, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(largest)
-        # Expand slightly
-        pad = 15
-        x = max(0, x - pad)
-        y = max(0, y - pad)
-        w = min(img.shape[1] - x, w + pad*2)
-        h = min(img.shape[0] - y, h + pad*2)
-        cropped = img[y:y+h, x:x+w]
-        if cropped.size > 0 and min(cropped.shape[:2]) > 40:
-            return cropped
+        # Get top 2 largest contours and combine
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:2]
+        if contours:
+            x, y, w, h = cv2.boundingRect(contours[0])
+            for c in contours[1:]:
+                x2, y2, w2, h2 = cv2.boundingRect(c)
+                x = min(x, x2)
+                y = min(y, y2)
+                w = max(x + w, x2 + w2) - x
+                h = max(y + h, y2 + h2) - y
+            
+            pad = 20
+            x = max(0, x - pad)
+            y = max(0, y - pad)
+            w = min(img.shape[1] - x, w + pad*2)
+            h = min(img.shape[0] - y, h + pad*2)
+            cropped = img[y:y+h, x:x+w]
+            if cropped.size > 0 and min(cropped.shape[:2]) > 30:
+                return cropped
     
-    # Fallback: center crop
+    # Fallback
     h, w = img.shape[:2]
-    return img[int(h*0.2):int(h*0.8), int(w*0.15):int(w*0.85)]
+    return img[int(h*0.15):int(h*0.85), int(w*0.1):int(w*0.9)]
 
 def compute_metrics(frame, ref):
-    """Compare isolated product regions only"""
+    """Lenient product comparison"""
     frame_prod = isolate_product(frame)
     ref_prod = isolate_product(ref)
     
-    # Resize to same size
-    size = (280, 280)
+    size = (250, 250)
     frame_r = cv2.resize(frame_prod, size, interpolation=cv2.INTER_AREA)
     ref_r = cv2.resize(ref_prod, size, interpolation=cv2.INTER_AREA)
     
     gray1 = cv2.cvtColor(frame_r, cv2.COLOR_BGR2GRAY)
     gray2 = cv2.cvtColor(ref_r, cv2.COLOR_BGR2GRAY)
     
+    # SSIM with lower weight
     ssim_score = float(ssim(gray1, gray2, data_range=255))
     
-    # Color histogram on product only
-    hist1 = cv2.calcHist([frame_r], [0,1,2], None, [12,12,12], [0,256]*3)
-    hist2 = cv2.calcHist([ref_r], [0,1,2], None, [12,12,12], [0,256]*3)
+    # Color histogram - more lenient
+    hist1 = cv2.calcHist([frame_r], [0,1,2], None, [8,8,8], [0,256]*3)
+    hist2 = cv2.calcHist([ref_r], [0,1,2], None, [8,8,8], [0,256]*3)
     cv2.normalize(hist1, hist1, 0, 1, cv2.NORM_MINMAX)
     cv2.normalize(hist2, hist2, 0, 1, cv2.NORM_MINMAX)
     hist_corr = float(cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL))
     hist_score = max(0.0, hist_corr)
     
+    # Boost score if colors are reasonably similar
+    if hist_score > 0.4:
+        hist_score = min(1.0, hist_score * 1.3)
+    
     # Diff
     diff = cv2.absdiff(gray1, gray2)
-    _, thresh = cv2.threshold(diff, 40, 255, cv2.THRESH_BINARY)
+    _, thresh = cv2.threshold(diff, 50, 255, cv2.THRESH_BINARY)
     diff_percent = float(np.sum(thresh > 0) / thresh.size * 100)
     
-    # Heavier on color for product matching
-    combined = (ssim_score * 0.45) + (hist_score * 0.55)
+    # More weight on color, less on exact structure
+    combined = (ssim_score * 0.35) + (hist_score * 0.65)
+    
+    # Soften very low scores
+    if combined < 0.3 and hist_score > 0.3:
+        combined = combined * 1.4
     
     return {
         "ssim": round(ssim_score, 3),
         "hist": round(hist_score, 3),
         "diff_percent": round(diff_percent, 1),
-        "combined": round(combined, 3)
+        "combined": round(min(1.0, combined), 3)
     }
 
 @app.get("/", response_class=HTMLResponse)
@@ -236,7 +250,7 @@ async def home():
             <h1>Video Analyzer</h1>
             <span class="version">{VERSION}</span>
         </div>
-        <p class="subtitle">Product-only comparison. Isolates light-colored products and ignores the background.</p>
+        <p class="subtitle">Lenient product matching. Focuses on product color and type across different scenes.</p>
         
         <div class="card">
             <form id="form">
@@ -253,7 +267,7 @@ async def home():
                 
                 <div class="controls">
                     <label>Interval <input type="number" name="interval" value="0.5" step="0.1" min="0.2" max="2"> sec</label>
-                    <label>Threshold <input type="number" name="threshold" value="0.35" step="0.05" min="0.15" max="0.70"></label>
+                    <label>Threshold <input type="number" name="threshold" value="0.30" step="0.05" min="0.15" max="0.60"></label>
                 </div>
                 
                 <button type="submit">Analyze Video</button>
@@ -268,7 +282,7 @@ async def home():
         e.preventDefault();
         const result = document.getElementById('result');
         result.style.display = 'block';
-        result.innerHTML = '<p style="text-align:center; color:#94a3b8;">Isolating product and analyzing... 15-40 seconds</p>';
+        result.innerHTML = '<p style="text-align:center; color:#94a3b8;">Analyzing product... 15-40 seconds</p>';
         
         const formData = new FormData(e.target);
         try {{
@@ -281,8 +295,8 @@ async def home():
             }}
             
             let verdictClass = 'mid';
-            if (data.overall_score >= 0.50) verdictClass = 'high';
-            else if (data.overall_score < 0.32) verdictClass = 'low';
+            if (data.overall_score >= 0.45) verdictClass = 'high';
+            else if (data.overall_score < 0.28) verdictClass = 'low';
             
             let rows = data.details.map(d => 
                 `<tr><td>${{d.time}}</td><td>${{d.ssim}}</td><td>${{d.hist}}</td><td>${{d.diff_percent}}%</td><td><strong>${{d.combined}}</strong></td></tr>`
@@ -301,7 +315,7 @@ async def home():
                     <div class="metric-card"><div class="value">${{data.low_percent}}%</div><div class="label">Flagged</div></div>
                 </div>
                 <div class="note">
-                    <strong>Product Isolation:</strong> Light-colored products are automatically extracted. Background is ignored.
+                    <strong>Lenient Mode:</strong> Prioritizes product color similarity. More forgiving of different backgrounds and angles.
                 </div>
                 <h3 style="margin: 20px 0 8px; color:#cbd5e1;">Frame Details</h3>
                 <table>
@@ -323,7 +337,7 @@ async def analyze(
     video: UploadFile = File(...),
     reference: UploadFile = File(...),
     interval: float = Form(0.5),
-    threshold: float = Form(0.35)
+    threshold: float = Form(0.30)
 ):
     try:
         video_bytes = await video.read()
@@ -390,14 +404,14 @@ async def analyze(
         avg_diff = float(np.mean(diff_percents))
         low_count = sum(1 for s in combined_scores if s < threshold)
         
-        if overall >= 0.55:
-            verdict = "HIGH MATCH — product looks consistent"
-        elif overall >= 0.38:
-            verdict = "MODERATE MATCH — some differences"
-        elif overall >= 0.25:
-            verdict = "LOW MATCH — noticeable differences"
+        if overall >= 0.50:
+            verdict = "GOOD MATCH — product type is consistent"
+        elif overall >= 0.35:
+            verdict = "MODERATE MATCH — similar product"
+        elif overall >= 0.22:
+            verdict = "PARTIAL MATCH — some similarities"
         else:
-            verdict = "POOR MATCH — product differs significantly"
+            verdict = "POOR MATCH — different product"
         
         return {
             "overall_score": round(overall, 3),
