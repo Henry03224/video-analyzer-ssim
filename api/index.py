@@ -7,7 +7,7 @@ from PIL import Image
 import tempfile
 import os
 
-VERSION = "v2.4.0"
+VERSION = "v2.5.0"
 app = FastAPI(title="Video Analyzer")
 
 MAX_VIDEO_SIZE = 15 * 1024 * 1024
@@ -51,7 +51,7 @@ def compute_orb_score(img1, img2):
     gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
     gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
     
-    orb = cv2.ORB_create(nfeatures=400)
+    orb = cv2.ORB_create(nfeatures=500)
     kp1, des1 = orb.detectAndCompute(gray1, None)
     kp2, des2 = orb.detectAndCompute(gray2, None)
     
@@ -65,9 +65,9 @@ def compute_orb_score(img1, img2):
         return 0.0
     
     matches = sorted(matches, key=lambda x: x.distance)
-    good = [m for m in matches if m.distance < 60]
+    good = [m for m in matches if m.distance < 55]
     
-    score = min(1.0, len(good) / 20.0)
+    score = min(1.0, len(good) / 18.0)
     return float(score)
 
 def compute_edge_score(img1, img2):
@@ -116,7 +116,7 @@ def compute_metrics(frame, ref):
     cv2.normalize(hist2, hist2, 0, 1, cv2.NORM_MINMAX)
     color_score = max(0.0, float(cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)))
     
-    combined = (orb_score * 0.45) + (edge_score * 0.30) + (hash_score * 0.15) + (color_score * 0.10)
+    combined = (orb_score * 0.50) + (edge_score * 0.25) + (hash_score * 0.15) + (color_score * 0.10)
     
     return {
         "orb": round(orb_score * 100, 1),
@@ -282,7 +282,7 @@ async def home():
             <h1>Video Analyzer</h1>
             <span class="version">{VERSION}</span>
         </div>
-        <p class="subtitle">50% and below = VIOLATION. Style-focused matching.</p>
+        <p class="subtitle">ORB Style ≤ 60% = VIOLATION</p>
         
         <div class="card">
             <form id="form">
@@ -301,7 +301,6 @@ async def home():
                 
                 <div class="controls">
                     <label>Interval <input type="number" name="interval" value="0.5" step="0.1" min="0.2" max="2"> sec</label>
-                    <label>Threshold <input type="number" name="threshold" value="50" step="5" min="30" max="70"> %</label>
                 </div>
                 
                 <button type="submit">Analyze Video</button>
@@ -316,7 +315,7 @@ async def home():
         e.preventDefault();
         const result = document.getElementById('result');
         result.style.display = 'block';
-        result.innerHTML = '<p style="text-align:center; color:#94a3b8;">Analyzing... 15-45 seconds</p>';
+        result.innerHTML = '<p style="text-align:center; color:#94a3b8;">Analyzing ORB Style... 15-45 seconds</p>';
         
         const formData = new FormData(e.target);
         
@@ -356,23 +355,23 @@ async def home():
             
             result.innerHTML = `
                 <div class="overall">
-                    <div class="overall-score">${{data.overall_score}}%</div>
-                    <div class="overall-label">Overall Style Score</div>
+                    <div class="overall-score">${{data.avg_orb}}%</div>
+                    <div class="overall-label">ORB Style Score</div>
                 </div>
                 <div class="verdict ${{verdictClass}}">${{data.verdict}}</div>
                 <div class="metrics">
-                    <div class="metric-card"><div class="value">${{data.avg_orb}}%</div><div class="label">ORB Style</div></div>
+                    <div class="metric-card"><div class="value">${{data.overall_score}}%</div><div class="label">Combined</div></div>
                     <div class="metric-card"><div class="value">${{data.avg_edge}}%</div><div class="label">Edges</div></div>
                     <div class="metric-card"><div class="value">${{data.avg_hash}}%</div><div class="label">Hash</div></div>
                     <div class="metric-card"><div class="value">${{data.avg_color}}%</div><div class="label">Color</div></div>
-                    <div class="metric-card"><div class="value">${{data.low_percent}}%</div><div class="label">Flagged</div></div>
+                    <div class="metric-card"><div class="value">${{data.low_percent}}%</div><div class="label">Low ORB Frames</div></div>
                 </div>
                 <div class="note">
-                    <strong>Rule:</strong> Score of 50% or below = VIOLATION.
+                    <strong>Rule:</strong> ORB Style ≤ 60% = VIOLATION.
                 </div>
                 <h3 style="margin: 20px 0 8px; color:#cbd5e1;">Frame Details</h3>
                 <table>
-                    <thead><tr><th>Time</th><th>ORB</th><th>Edge</th><th>Hash</th><th>Color</th><th>Score</th></tr></thead>
+                    <thead><tr><th>Time</th><th>ORB</th><th>Edge</th><th>Hash</th><th>Color</th><th>Combined</th></tr></thead>
                     <tbody>${{rows}}</tbody>
                 </table>
             `;
@@ -389,17 +388,16 @@ async def home():
 async def analyze(
     video: UploadFile = File(...),
     reference: UploadFile = File(...),
-    interval: float = Form(0.5),
-    threshold: float = Form(50)
+    interval: float = Form(0.5)
 ):
     try:
         video_bytes = await video.read()
         ref_bytes = await reference.read()
         
         if len(video_bytes) > MAX_VIDEO_SIZE:
-            return JSONResponse({"error": f"Video too large. Max 15MB."})
+            return JSONResponse({"error": "Video too large. Max 15MB."})
         if len(ref_bytes) > MAX_IMAGE_SIZE:
-            return JSONResponse({"error": f"Image too large. Max 8MB."})
+            return JSONResponse({"error": "Image too large. Max 8MB."})
         
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_vid:
             tmp_vid.write(video_bytes)
@@ -461,29 +459,29 @@ async def analyze(
             try: os.unlink(p)
             except: pass
         
-        if not combined_scores:
+        if not orb_scores:
             return JSONResponse({"error": "No frames analyzed"})
         
-        scores = np.array(combined_scores)
-        overall = float(np.mean(scores))
-        low_count = sum(1 for s in combined_scores if s < threshold)
+        avg_orb = float(np.mean(orb_scores))
+        overall = float(np.mean(combined_scores))
+        low_orb_count = sum(1 for s in orb_scores if s <= 60)
         
-        is_violation = overall <= 50
+        is_violation = avg_orb <= 60
         
         if is_violation:
-            verdict = "VIOLATION — Score 50% or below"
+            verdict = "VIOLATION — ORB Style ≤ 60%"
         else:
-            verdict = "PASS — Score above 50%"
+            verdict = "PASS — ORB Style above 60%"
         
         return {
             "overall_score": round(overall, 1),
-            "avg_orb": round(float(np.mean(orb_scores)), 1),
+            "avg_orb": round(avg_orb, 1),
             "avg_edge": round(float(np.mean(edge_scores)), 1),
             "avg_hash": round(float(np.mean(hash_scores)), 1),
             "avg_color": round(float(np.mean(color_scores)), 1),
-            "min_combined": round(float(np.min(scores)), 1),
-            "max_combined": round(float(np.max(scores)), 1),
-            "low_percent": round(100 * low_count / len(combined_scores), 1),
+            "min_orb": round(float(np.min(orb_scores)), 1),
+            "max_orb": round(float(np.max(orb_scores)), 1),
+            "low_percent": round(100 * low_orb_count / len(orb_scores), 1),
             "verdict": verdict,
             "is_violation": is_violation,
             "details": details,
