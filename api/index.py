@@ -6,11 +6,11 @@ from skimage.metrics import structural_similarity as ssim
 import tempfile
 import os
 
-VERSION = "v1.3.0"
+VERSION = "v1.4.0"
 app = FastAPI(title="Video Analyzer")
 
 def compute_metrics(frame, ref):
-    """Balanced multi-metric + difference analysis"""
+    """Softer multi-metric comparison"""
     if frame.shape != ref.shape:
         frame = cv2.resize(frame, (ref.shape[1], ref.shape[0]), interpolation=cv2.INTER_AREA)
     
@@ -26,17 +26,17 @@ def compute_metrics(frame, ref):
     hist_corr = float(cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL))
     hist_score = max(0.0, hist_corr)
     
-    # MAD
+    # MAD (softer)
     mad = float(np.mean(cv2.absdiff(frame.astype(np.float32), ref.astype(np.float32))))
-    mad_score = max(0.0, 1.0 - (mad / 80.0))
+    mad_score = max(0.0, 1.0 - (mad / 100.0))
     
-    # Difference map (for text/object detection)
+    # Diff percent (for text/object detection)
     diff = cv2.absdiff(gray1, gray2)
-    _, thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+    _, thresh = cv2.threshold(diff, 40, 255, cv2.THRESH_BINARY)
     diff_percent = float(np.sum(thresh > 0) / thresh.size * 100)
     
-    # Combined
-    combined = (ssim_score * 0.50) + (hist_score * 0.25) + (mad_score * 0.25)
+    # Combined - heavier on SSIM
+    combined = (ssim_score * 0.60) + (hist_score * 0.25) + (mad_score * 0.15)
     
     return {
         "ssim": round(ssim_score, 3),
@@ -207,7 +207,7 @@ async def home():
                 
                 <div class="controls">
                     <label>Interval <input type="number" name="interval" value="0.5" step="0.1" min="0.2" max="2"> sec</label>
-                    <label>Threshold <input type="number" name="threshold" value="0.60" step="0.05" min="0.3" max="0.9"></label>
+                    <label>Threshold <input type="number" name="threshold" value="0.50" step="0.05" min="0.3" max="0.85"></label>
                 </div>
                 
                 <button type="submit">Analyze Video</button>
@@ -235,8 +235,8 @@ async def home():
             }}
             
             let verdictClass = 'mid';
-            if (data.avg_combined >= 0.70) verdictClass = 'high';
-            else if (data.avg_combined < 0.45) verdictClass = 'low';
+            if (data.avg_combined >= 0.65) verdictClass = 'high';
+            else if (data.avg_combined < 0.40) verdictClass = 'low';
             
             let rows = data.details.map(d => 
                 `<tr><td>${{d.time}}</td><td>${{d.ssim}}</td><td>${{d.hist}}</td><td>${{d.diff_percent}}%</td><td><strong>${{d.combined}}</strong></td></tr>`
@@ -252,7 +252,7 @@ async def home():
                 </div>
                 <div class="verdict ${{verdictClass}}">${{data.verdict}}</div>
                 <div class="note">
-                    <strong>Diff Area</strong> shows how much of the frame changed. Higher values often indicate text edits, added objects, or overlays.
+                    <strong>Diff Area</strong> shows how much of the frame changed. Higher values often indicate text edits or added objects.
                 </div>
                 <h3 style="margin: 20px 0 8px; color:#cbd5e1;">Frame Scores</h3>
                 <table>
@@ -274,7 +274,7 @@ async def analyze(
     video: UploadFile = File(...),
     reference: UploadFile = File(...),
     interval: float = Form(0.5),
-    threshold: float = Form(0.60)
+    threshold: float = Form(0.50)
 ):
     try:
         video_bytes = await video.read()
@@ -341,13 +341,13 @@ async def analyze(
         avg_diff = float(np.mean(diff_percents))
         low_count = sum(1 for s in combined_scores if s < threshold)
         
-        # Enhanced verdict considering diff area
-        if avg >= 0.75 and avg_diff < 5:
+        # Softer verdict
+        if avg >= 0.70:
             verdict = "VERY SIMILAR — minimal changes detected"
-        elif avg >= 0.55 and avg_diff < 15:
+        elif avg >= 0.50:
             verdict = "MODERATE DIFFERENCES"
-        elif avg_diff >= 10:
-            verdict = "NOTICEABLE CHANGES (text/object likely modified)"
+        elif avg >= 0.35:
+            verdict = "NOTICEABLE CHANGES"
         else:
             verdict = "VERY DIFFERENT — likely edited or unrelated"
         
