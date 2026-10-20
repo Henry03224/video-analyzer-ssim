@@ -7,14 +7,13 @@ from PIL import Image
 import tempfile
 import os
 
-VERSION = "v2.3.0"
+VERSION = "v2.4.0"
 app = FastAPI(title="Video Analyzer")
 
-MAX_VIDEO_SIZE = 15 * 1024 * 1024  # 15 MB
-MAX_IMAGE_SIZE = 8 * 1024 * 1024   # 8 MB
+MAX_VIDEO_SIZE = 15 * 1024 * 1024
+MAX_IMAGE_SIZE = 8 * 1024 * 1024
 
 def isolate_product(img):
-    """Isolate light product"""
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     lower = np.array([0, 0, 120])
     upper = np.array([180, 100, 255])
@@ -259,9 +258,8 @@ async def home():
             margin: 16px 0;
             font-size: 1.1rem;
         }}
-        .verdict.high {{ background: #065f46; color: #6ee7b7; }}
-        .verdict.mid {{ background: #854d0e; color: #fde047; }}
-        .verdict.low {{ background: #7f1d1d; color: #fca5a5; }}
+        .verdict.pass {{ background: #065f46; color: #6ee7b7; }}
+        .verdict.violation {{ background: #7f1d1d; color: #fca5a5; }}
         table {{ width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 0.78rem; }}
         th, td {{ padding: 8px 8px; text-align: left; border-bottom: 1px solid #334155; }}
         th {{ color: #94a3b8; font-weight: 500; }}
@@ -284,7 +282,7 @@ async def home():
             <h1>Video Analyzer</h1>
             <span class="version">{VERSION}</span>
         </div>
-        <p class="subtitle">Style-focused matching. Max video: 15MB, image: 8MB.</p>
+        <p class="subtitle">50% and below = VIOLATION. Style-focused matching.</p>
         
         <div class="card">
             <form id="form">
@@ -303,7 +301,7 @@ async def home():
                 
                 <div class="controls">
                     <label>Interval <input type="number" name="interval" value="0.5" step="0.1" min="0.2" max="2"> sec</label>
-                    <label>Threshold <input type="number" name="threshold" value="35" step="5" min="15" max="65"> %</label>
+                    <label>Threshold <input type="number" name="threshold" value="50" step="5" min="30" max="70"> %</label>
                 </div>
                 
                 <button type="submit">Analyze Video</button>
@@ -318,11 +316,10 @@ async def home():
         e.preventDefault();
         const result = document.getElementById('result');
         result.style.display = 'block';
-        result.innerHTML = '<p style="text-align:center; color:#94a3b8;">Analyzing style... 15-45 seconds</p>';
+        result.innerHTML = '<p style="text-align:center; color:#94a3b8;">Analyzing... 15-45 seconds</p>';
         
         const formData = new FormData(e.target);
         
-        // Client-side size check
         const videoFile = e.target.video.files[0];
         const imgFile = e.target.reference.files[0];
         if (videoFile && videoFile.size > 15 * 1024 * 1024) {{
@@ -342,7 +339,7 @@ async def home():
             try {{
                 data = JSON.parse(text);
             }} catch {{
-                result.innerHTML = `<div class="error">Server error (not JSON):\n${{text.substring(0, 500)}}</div>`;
+                result.innerHTML = `<div class="error">Server error:\n${{text.substring(0, 500)}}</div>`;
                 return;
             }}
             
@@ -351,9 +348,7 @@ async def home():
                 return;
             }}
             
-            let verdictClass = 'mid';
-            if (data.overall_score >= 50) verdictClass = 'high';
-            else if (data.overall_score < 30) verdictClass = 'low';
+            let verdictClass = data.is_violation ? 'violation' : 'pass';
             
             let rows = data.details.map(d => 
                 `<tr><td>${{d.time}}</td><td>${{d.orb}}%</td><td>${{d.edge}}%</td><td>${{d.hash}}%</td><td>${{d.color}}%</td><td><strong>${{d.combined}}%</strong></td></tr>`
@@ -373,7 +368,7 @@ async def home():
                     <div class="metric-card"><div class="value">${{data.low_percent}}%</div><div class="label">Flagged</div></div>
                 </div>
                 <div class="note">
-                    <strong>v2.3:</strong> Style-focused (ORB + Edges). Better error messages.
+                    <strong>Rule:</strong> Score of 50% or below = VIOLATION.
                 </div>
                 <h3 style="margin: 20px 0 8px; color:#cbd5e1;">Frame Details</h3>
                 <table>
@@ -395,14 +390,14 @@ async def analyze(
     video: UploadFile = File(...),
     reference: UploadFile = File(...),
     interval: float = Form(0.5),
-    threshold: float = Form(35)
+    threshold: float = Form(50)
 ):
     try:
         video_bytes = await video.read()
         ref_bytes = await reference.read()
         
         if len(video_bytes) > MAX_VIDEO_SIZE:
-            return JSONResponse({"error": f"Video too large ({len(video_bytes)//1024//1024}MB). Max 15MB."})
+            return JSONResponse({"error": f"Video too large. Max 15MB."})
         if len(ref_bytes) > MAX_IMAGE_SIZE:
             return JSONResponse({"error": f"Image too large. Max 8MB."})
         
@@ -473,14 +468,12 @@ async def analyze(
         overall = float(np.mean(scores))
         low_count = sum(1 for s in combined_scores if s < threshold)
         
-        if overall >= 55:
-            verdict = "GOOD STYLE MATCH — product shape aligns"
-        elif overall >= 38:
-            verdict = "MODERATE MATCH — similar style"
-        elif overall >= 25:
-            verdict = "PARTIAL MATCH — some style similarities"
+        is_violation = overall <= 50
+        
+        if is_violation:
+            verdict = "VIOLATION — Score 50% or below"
         else:
-            verdict = "POOR MATCH — different style"
+            verdict = "PASS — Score above 50%"
         
         return {
             "overall_score": round(overall, 1),
@@ -492,6 +485,7 @@ async def analyze(
             "max_combined": round(float(np.max(scores)), 1),
             "low_percent": round(100 * low_count / len(combined_scores), 1),
             "verdict": verdict,
+            "is_violation": is_violation,
             "details": details,
             "samples": len(details),
             "version": VERSION
