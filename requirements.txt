@@ -1,5 +1,7 @@
-streamlit
+fastapi
+uvicorn
 opencv-python-headless
 scikit-image
-pillow
 numpy
+pillow
+python-multipart
