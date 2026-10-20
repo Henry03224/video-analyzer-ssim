@@ -7,8 +7,11 @@ from PIL import Image
 import tempfile
 import os
 
-VERSION = "v2.2.0"
+VERSION = "v2.3.0"
 app = FastAPI(title="Video Analyzer")
+
+MAX_VIDEO_SIZE = 15 * 1024 * 1024  # 15 MB
+MAX_IMAGE_SIZE = 8 * 1024 * 1024   # 8 MB
 
 def isolate_product(img):
     """Isolate light product"""
@@ -46,11 +49,10 @@ def isolate_product(img):
     return img[int(h*0.15):int(h*0.85), int(w*0.1):int(w*0.9)]
 
 def compute_orb_score(img1, img2):
-    """ORB feature matching for style"""
     gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
     gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
     
-    orb = cv2.ORB_create(nfeatures=500)
+    orb = cv2.ORB_create(nfeatures=400)
     kp1, des1 = orb.detectAndCompute(gray1, None)
     kp2, des2 = orb.detectAndCompute(gray2, None)
     
@@ -70,15 +72,12 @@ def compute_orb_score(img1, img2):
     return float(score)
 
 def compute_edge_score(img1, img2):
-    """Edge-based style comparison"""
     gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
     gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
     
-    # Canny edges
     edges1 = cv2.Canny(gray1, 40, 120)
     edges2 = cv2.Canny(gray2, 40, 120)
     
-    # Compare edge maps
     intersection = np.logical_and(edges1 > 0, edges2 > 0).sum()
     union = np.logical_or(edges1 > 0, edges2 > 0).sum()
     
@@ -86,10 +85,9 @@ def compute_edge_score(img1, img2):
         return 0.0
     
     iou = intersection / union
-    return float(min(1.0, iou * 2.5))  # boost
+    return float(min(1.0, iou * 2.5))
 
 def compute_hash_score(img1, img2):
-    """Perceptual hash"""
     def to_pil(cv_img):
         rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
         return Image.fromarray(rgb)
@@ -102,11 +100,10 @@ def compute_hash_score(img1, img2):
     return max(0.0, float(score))
 
 def compute_metrics(frame, ref):
-    """Style-focused: ORB + Edges + Hash"""
     frame_prod = isolate_product(frame)
     ref_prod = isolate_product(ref)
     
-    size = (260, 260)
+    size = (240, 240)
     frame_r = cv2.resize(frame_prod, size, interpolation=cv2.INTER_AREA)
     ref_r = cv2.resize(ref_prod, size, interpolation=cv2.INTER_AREA)
     
@@ -114,14 +111,12 @@ def compute_metrics(frame, ref):
     edge_score = compute_edge_score(frame_r, ref_r)
     hash_score = compute_hash_score(frame_r, ref_r)
     
-    # Light color check (secondary)
     hist1 = cv2.calcHist([frame_r], [0,1,2], None, [6,6,6], [0,256]*3)
     hist2 = cv2.calcHist([ref_r], [0,1,2], None, [6,6,6], [0,256]*3)
     cv2.normalize(hist1, hist1, 0, 1, cv2.NORM_MINMAX)
     cv2.normalize(hist2, hist2, 0, 1, cv2.NORM_MINMAX)
     color_score = max(0.0, float(cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)))
     
-    # Style-focused weights: ORB 45%, Edges 30%, Hash 15%, Color 10%
     combined = (orb_score * 0.45) + (edge_score * 0.30) + (hash_score * 0.15) + (color_score * 0.10)
     
     return {
@@ -270,7 +265,7 @@ async def home():
         table {{ width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 0.78rem; }}
         th, td {{ padding: 8px 8px; text-align: left; border-bottom: 1px solid #334155; }}
         th {{ color: #94a3b8; font-weight: 500; }}
-        .error {{ color: #f87171; background: #7f1d1d; padding: 12px; border-radius: 8px; }}
+        .error {{ color: #f87171; background: #7f1d1d; padding: 12px; border-radius: 8px; white-space: pre-wrap; }}
         .note {{
             background: #1e3a5f;
             border-left: 4px solid #60a5fa;
@@ -280,6 +275,7 @@ async def home():
             font-size: 0.9rem;
             color: #cbd5e1;
         }}
+        .warning {{ color: #fbbf24; font-size: 0.85rem; margin-top: 8px; }}
     </style>
 </head>
 <body>
@@ -288,7 +284,7 @@ async def home():
             <h1>Video Analyzer</h1>
             <span class="version">{VERSION}</span>
         </div>
-        <p class="subtitle">Style-focused matching: ORB (shape) + Edges + Hash. Less dependent on color.</p>
+        <p class="subtitle">Style-focused matching. Max video: 15MB, image: 8MB.</p>
         
         <div class="card">
             <form id="form">
@@ -296,10 +292,12 @@ async def home():
                     <div class="upload-box">
                         <p>Video</p>
                         <input type="file" name="video" accept="video/*" required>
+                        <div class="warning">Max 15MB</div>
                     </div>
                     <div class="upload-box">
                         <p>Reference Image</p>
                         <input type="file" name="reference" accept="image/*" required>
+                        <div class="warning">Max 8MB</div>
                     </div>
                 </div>
                 
@@ -323,9 +321,30 @@ async def home():
         result.innerHTML = '<p style="text-align:center; color:#94a3b8;">Analyzing style... 15-45 seconds</p>';
         
         const formData = new FormData(e.target);
+        
+        // Client-side size check
+        const videoFile = e.target.video.files[0];
+        const imgFile = e.target.reference.files[0];
+        if (videoFile && videoFile.size > 15 * 1024 * 1024) {{
+            result.innerHTML = '<div class="error">Video too large. Max 15MB.</div>';
+            return;
+        }}
+        if (imgFile && imgFile.size > 8 * 1024 * 1024) {{
+            result.innerHTML = '<div class="error">Image too large. Max 8MB.</div>';
+            return;
+        }}
+        
         try {{
             const res = await fetch('/analyze', {{ method: 'POST', body: formData }});
-            const data = await res.json();
+            const text = await res.text();
+            
+            let data;
+            try {{
+                data = JSON.parse(text);
+            }} catch {{
+                result.innerHTML = `<div class="error">Server error (not JSON):\n${{text.substring(0, 500)}}</div>`;
+                return;
+            }}
             
             if (data.error) {{
                 result.innerHTML = `<div class="error">${{data.error}}</div>`;
@@ -354,7 +373,7 @@ async def home():
                     <div class="metric-card"><div class="value">${{data.low_percent}}%</div><div class="label">Flagged</div></div>
                 </div>
                 <div class="note">
-                    <strong>v2.2 Style Focus:</strong> 45% ORB (shape features) + 30% Edges + 15% Hash + 10% Color.
+                    <strong>v2.3:</strong> Style-focused (ORB + Edges). Better error messages.
                 </div>
                 <h3 style="margin: 20px 0 8px; color:#cbd5e1;">Frame Details</h3>
                 <table>
@@ -363,7 +382,7 @@ async def home():
                 </table>
             `;
         }} catch (err) {{
-            result.innerHTML = `<div class="error">Error: ${{err.message}}</div>`;
+            result.innerHTML = `<div class="error">Request failed: ${{err.message}}</div>`;
         }}
     }};
     </script>
@@ -381,6 +400,11 @@ async def analyze(
     try:
         video_bytes = await video.read()
         ref_bytes = await reference.read()
+        
+        if len(video_bytes) > MAX_VIDEO_SIZE:
+            return JSONResponse({"error": f"Video too large ({len(video_bytes)//1024//1024}MB). Max 15MB."})
+        if len(ref_bytes) > MAX_IMAGE_SIZE:
+            return JSONResponse({"error": f"Image too large. Max 8MB."})
         
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_vid:
             tmp_vid.write(video_bytes)
@@ -408,7 +432,7 @@ async def analyze(
         hash_scores = []
         color_scores = []
         frame_idx = 0
-        max_samples = 35
+        max_samples = 25
         
         while len(details) < max_samples:
             ret, frame = cap.read()
@@ -474,4 +498,4 @@ async def analyze(
         }
         
     except Exception as e:
-        return JSONResponse({"error": str(e)})
+        return JSONResponse({"error": f"Processing error: {str(e)}"})
