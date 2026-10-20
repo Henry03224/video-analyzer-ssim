@@ -6,16 +6,18 @@ from skimage.metrics import structural_similarity as ssim
 import tempfile
 import os
 
-VERSION = "v1.4.0"
+VERSION = "v1.5.0"
 app = FastAPI(title="Video Analyzer")
 
 def compute_metrics(frame, ref):
-    """Softer multi-metric comparison"""
+    """Practical scoring for product videos"""
     if frame.shape != ref.shape:
         frame = cv2.resize(frame, (ref.shape[1], ref.shape[0]), interpolation=cv2.INTER_AREA)
     
     gray1 = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray2 = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY)
+    
+    # SSIM
     ssim_score = float(ssim(gray1, gray2, data_range=255))
     
     # Histogram
@@ -26,22 +28,17 @@ def compute_metrics(frame, ref):
     hist_corr = float(cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL))
     hist_score = max(0.0, hist_corr)
     
-    # MAD (softer)
-    mad = float(np.mean(cv2.absdiff(frame.astype(np.float32), ref.astype(np.float32))))
-    mad_score = max(0.0, 1.0 - (mad / 100.0))
-    
-    # Diff percent (for text/object detection)
+    # Diff with higher threshold (ignore small lighting differences)
     diff = cv2.absdiff(gray1, gray2)
-    _, thresh = cv2.threshold(diff, 40, 255, cv2.THRESH_BINARY)
+    _, thresh = cv2.threshold(diff, 60, 255, cv2.THRESH_BINARY)
     diff_percent = float(np.sum(thresh > 0) / thresh.size * 100)
     
-    # Combined - heavier on SSIM
-    combined = (ssim_score * 0.60) + (hist_score * 0.25) + (mad_score * 0.15)
+    # Combined - prioritize SSIM and histogram
+    combined = (ssim_score * 0.65) + (hist_score * 0.35)
     
     return {
         "ssim": round(ssim_score, 3),
         "hist": round(hist_score, 3),
-        "mad": round(mad, 1),
         "diff_percent": round(diff_percent, 1),
         "combined": round(combined, 3)
     }
@@ -190,7 +187,7 @@ async def home():
             <h1>Video Analyzer</h1>
             <span class="version">{VERSION}</span>
         </div>
-        <p class="subtitle">Detect text changes, added objects, and content differences.</p>
+        <p class="subtitle">Detect significant changes (text, objects) while ignoring minor lighting differences.</p>
         
         <div class="card">
             <form id="form">
@@ -207,7 +204,7 @@ async def home():
                 
                 <div class="controls">
                     <label>Interval <input type="number" name="interval" value="0.5" step="0.1" min="0.2" max="2"> sec</label>
-                    <label>Threshold <input type="number" name="threshold" value="0.50" step="0.05" min="0.3" max="0.85"></label>
+                    <label>Threshold <input type="number" name="threshold" value="0.40" step="0.05" min="0.2" max="0.75"></label>
                 </div>
                 
                 <button type="submit">Analyze Video</button>
@@ -235,8 +232,8 @@ async def home():
             }}
             
             let verdictClass = 'mid';
-            if (data.avg_combined >= 0.65) verdictClass = 'high';
-            else if (data.avg_combined < 0.40) verdictClass = 'low';
+            if (data.avg_combined >= 0.55) verdictClass = 'high';
+            else if (data.avg_combined < 0.35) verdictClass = 'low';
             
             let rows = data.details.map(d => 
                 `<tr><td>${{d.time}}</td><td>${{d.ssim}}</td><td>${{d.hist}}</td><td>${{d.diff_percent}}%</td><td><strong>${{d.combined}}</strong></td></tr>`
@@ -252,7 +249,7 @@ async def home():
                 </div>
                 <div class="verdict ${{verdictClass}}">${{data.verdict}}</div>
                 <div class="note">
-                    <strong>Diff Area</strong> shows how much of the frame changed. Higher values often indicate text edits or added objects.
+                    <strong>Tip:</strong> Diff Area ignores small lighting/angle differences. Focus on high Diff % for text or object changes.
                 </div>
                 <h3 style="margin: 20px 0 8px; color:#cbd5e1;">Frame Scores</h3>
                 <table>
@@ -274,7 +271,7 @@ async def analyze(
     video: UploadFile = File(...),
     reference: UploadFile = File(...),
     interval: float = Form(0.5),
-    threshold: float = Form(0.50)
+    threshold: float = Form(0.40)
 ):
     try:
         video_bytes = await video.read()
@@ -341,15 +338,15 @@ async def analyze(
         avg_diff = float(np.mean(diff_percents))
         low_count = sum(1 for s in combined_scores if s < threshold)
         
-        # Softer verdict
-        if avg >= 0.70:
-            verdict = "VERY SIMILAR — minimal changes detected"
-        elif avg >= 0.50:
+        # Practical verdict
+        if avg >= 0.60:
+            verdict = "SIMILAR — minor differences only"
+        elif avg >= 0.40:
             verdict = "MODERATE DIFFERENCES"
-        elif avg >= 0.35:
-            verdict = "NOTICEABLE CHANGES"
+        elif avg_diff > 25:
+            verdict = "SIGNIFICANT CHANGES DETECTED"
         else:
-            verdict = "VERY DIFFERENT — likely edited or unrelated"
+            verdict = "DIFFERENT CONTENT"
         
         return {
             "avg_combined": round(avg, 3),
