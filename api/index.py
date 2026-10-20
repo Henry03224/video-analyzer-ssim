@@ -6,47 +6,71 @@ from skimage.metrics import structural_similarity as ssim
 import tempfile
 import os
 
-VERSION = "v1.6.0"
+VERSION = "v1.7.0"
 app = FastAPI(title="Video Analyzer")
 
-def get_product_region(img):
-    """Crop center 60% as product focus area"""
+def extract_product_region(img):
+    """Try to focus on the main product by cropping center and removing dark borders"""
     h, w = img.shape[:2]
-    margin_h = int(h * 0.20)
-    margin_w = int(w * 0.20)
+    
+    # Remove dark UI bars if present (common in screenshots)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Find non-dark regions
+    _, mask = cv2.threshold(gray, 30, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if contours:
+        # Get largest non-dark region
+        largest = max(contours, key=cv2.contourArea)
+        x, y, cw, ch = cv2.boundingRect(largest)
+        # Add some margin
+        margin = 10
+        x = max(0, x - margin)
+        y = max(0, y - margin)
+        cw = min(w - x, cw + margin*2)
+        ch = min(h - y, ch + margin*2)
+        cropped = img[y:y+ch, x:x+cw]
+        if cropped.size > 0 and cropped.shape[0] > 50 and cropped.shape[1] > 50:
+            return cropped
+    
+    # Fallback: center 70%
+    margin_h = int(h * 0.15)
+    margin_w = int(w * 0.15)
     return img[margin_h:h-margin_h, margin_w:w-margin_w]
 
 def compute_metrics(frame, ref):
-    """Product-focused comparison"""
-    # Focus on center (product area)
-    frame_prod = get_product_region(frame)
-    ref_prod = get_product_region(ref)
+    """Product-focused comparison with better region extraction"""
+    # Extract product regions
+    frame_prod = extract_product_region(frame)
+    ref_prod = extract_product_region(ref)
     
-    # Resize to match
-    if frame_prod.shape != ref_prod.shape:
-        frame_prod = cv2.resize(frame_prod, (ref_prod.shape[1], ref_prod.shape[0]), interpolation=cv2.INTER_AREA)
+    # Resize to same size
+    target_size = (300, 300)
+    frame_resized = cv2.resize(frame_prod, target_size, interpolation=cv2.INTER_AREA)
+    ref_resized = cv2.resize(ref_prod, target_size, interpolation=cv2.INTER_AREA)
     
-    gray1 = cv2.cvtColor(frame_prod, cv2.COLOR_BGR2GRAY)
-    gray2 = cv2.cvtColor(ref_prod, cv2.COLOR_BGR2GRAY)
+    gray1 = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
+    gray2 = cv2.cvtColor(ref_resized, cv2.COLOR_BGR2GRAY)
     
-    # SSIM on product area
+    # SSIM
     ssim_score = float(ssim(gray1, gray2, data_range=255))
     
-    # Histogram on product area
-    hist1 = cv2.calcHist([frame_prod], [0,1,2], None, [8,8,8], [0,256]*3)
-    hist2 = cv2.calcHist([ref_prod], [0,1,2], None, [8,8,8], [0,256]*3)
+    # Color histogram (more bins for better product color matching)
+    hist1 = cv2.calcHist([frame_resized], [0,1,2], None, [16,16,16], [0,256]*3)
+    hist2 = cv2.calcHist([ref_resized], [0,1,2], None, [16,16,16], [0,256]*3)
     cv2.normalize(hist1, hist1, 0, 1, cv2.NORM_MINMAX)
     cv2.normalize(hist2, hist2, 0, 1, cv2.NORM_MINMAX)
     hist_corr = float(cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL))
     hist_score = max(0.0, hist_corr)
     
-    # Diff on product area
+    # Diff
     diff = cv2.absdiff(gray1, gray2)
-    _, thresh = cv2.threshold(diff, 50, 255, cv2.THRESH_BINARY)
+    _, thresh = cv2.threshold(diff, 45, 255, cv2.THRESH_BINARY)
     diff_percent = float(np.sum(thresh > 0) / thresh.size * 100)
     
-    # Combined (product-focused)
-    combined = (ssim_score * 0.60) + (hist_score * 0.40)
+    # Combined - balance structure and color
+    combined = (ssim_score * 0.55) + (hist_score * 0.45)
     
     return {
         "ssim": round(ssim_score, 3),
@@ -157,13 +181,13 @@ async def home():
             margin: 10px 0 24px;
         }}
         .overall-score {{
-            font-size: 4rem;
+            font-size: 4.2rem;
             font-weight: 800;
             background: linear-gradient(90deg, #60a5fa, #a78bfa);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }}
-        .overall-label {{ color: #94a3b8; font-size: 0.9rem; margin-top: 4px; }}
+        .overall-label {{ color: #94a3b8; font-size: 0.95rem; margin-top: 4px; }}
         .metrics {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
@@ -211,7 +235,7 @@ async def home():
             <h1>Video Analyzer</h1>
             <span class="version">{VERSION}</span>
         </div>
-        <p class="subtitle">Product-focused comparison. Ignores background and focuses on the center area.</p>
+        <p class="subtitle">Product-focused comparison. Automatically removes UI elements and focuses on the product.</p>
         
         <div class="card">
             <form id="form">
@@ -228,7 +252,7 @@ async def home():
                 
                 <div class="controls">
                     <label>Interval <input type="number" name="interval" value="0.5" step="0.1" min="0.2" max="2"> sec</label>
-                    <label>Threshold <input type="number" name="threshold" value="0.45" step="0.05" min="0.2" max="0.75"></label>
+                    <label>Threshold <input type="number" name="threshold" value="0.40" step="0.05" min="0.2" max="0.75"></label>
                 </div>
                 
                 <button type="submit">Analyze Video</button>
@@ -243,7 +267,7 @@ async def home():
         e.preventDefault();
         const result = document.getElementById('result');
         result.style.display = 'block';
-        result.innerHTML = '<p style="text-align:center; color:#94a3b8;">Analyzing product area... This may take 15-40 seconds</p>';
+        result.innerHTML = '<p style="text-align:center; color:#94a3b8;">Analyzing product... This may take 15-40 seconds</p>';
         
         const formData = new FormData(e.target);
         try {{
@@ -256,8 +280,8 @@ async def home():
             }}
             
             let verdictClass = 'mid';
-            if (data.overall_score >= 0.60) verdictClass = 'high';
-            else if (data.overall_score < 0.40) verdictClass = 'low';
+            if (data.overall_score >= 0.55) verdictClass = 'high';
+            else if (data.overall_score < 0.35) verdictClass = 'low';
             
             let rows = data.details.map(d => 
                 `<tr><td>${{d.time}}</td><td>${{d.ssim}}</td><td>${{d.hist}}</td><td>${{d.diff_percent}}%</td><td><strong>${{d.combined}}</strong></td></tr>`
@@ -276,7 +300,7 @@ async def home():
                     <div class="metric-card"><div class="value">${{data.low_percent}}%</div><div class="label">Flagged</div></div>
                 </div>
                 <div class="note">
-                    <strong>Product Focus:</strong> Comparison is done on the center 60% of the frame where products usually appear.
+                    <strong>Product Focus:</strong> Automatically crops to the main product region and removes UI bars from screenshots.
                 </div>
                 <h3 style="margin: 20px 0 8px; color:#cbd5e1;">Frame Details</h3>
                 <table>
@@ -298,7 +322,7 @@ async def analyze(
     video: UploadFile = File(...),
     reference: UploadFile = File(...),
     interval: float = Form(0.5),
-    threshold: float = Form(0.45)
+    threshold: float = Form(0.40)
 ):
     try:
         video_bytes = await video.read()
@@ -365,12 +389,11 @@ async def analyze(
         avg_diff = float(np.mean(diff_percents))
         low_count = sum(1 for s in combined_scores if s < threshold)
         
-        # Overall score verdict
-        if overall >= 0.65:
+        if overall >= 0.60:
             verdict = "HIGH MATCH — product looks consistent"
-        elif overall >= 0.45:
+        elif overall >= 0.42:
             verdict = "MODERATE MATCH — some differences detected"
-        elif overall >= 0.30:
+        elif overall >= 0.28:
             verdict = "LOW MATCH — significant changes possible"
         else:
             verdict = "POOR MATCH — product differs significantly"
