@@ -8,7 +8,7 @@ from PIL import Image
 import tempfile
 import os
 
-VERSION = "v2.0.0"
+VERSION = "v2.1.0"
 app = FastAPI(title="Video Analyzer")
 
 def isolate_product(img):
@@ -92,35 +92,29 @@ def compute_metrics(frame, ref):
     frame_r = cv2.resize(frame_prod, size, interpolation=cv2.INTER_AREA)
     ref_r = cv2.resize(ref_prod, size, interpolation=cv2.INTER_AREA)
     
-    # ORB
     orb_score = compute_orb_score(frame_r, ref_r)
-    
-    # ImageHash
     hash_score = compute_hash_score(frame_r, ref_r)
     
-    # Color histogram
     hist1 = cv2.calcHist([frame_r], [0,1,2], None, [8,8,8], [0,256]*3)
     hist2 = cv2.calcHist([ref_r], [0,1,2], None, [8,8,8], [0,256]*3)
     cv2.normalize(hist1, hist1, 0, 1, cv2.NORM_MINMAX)
     cv2.normalize(hist2, hist2, 0, 1, cv2.NORM_MINMAX)
     hist_corr = max(0.0, float(cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)))
     
-    # Diff
     gray1 = cv2.cvtColor(frame_r, cv2.COLOR_BGR2GRAY)
     gray2 = cv2.cvtColor(ref_r, cv2.COLOR_BGR2GRAY)
     diff = cv2.absdiff(gray1, gray2)
     _, thresh = cv2.threshold(diff, 45, 255, cv2.THRESH_BINARY)
     diff_percent = float(np.sum(thresh > 0) / thresh.size * 100)
     
-    # Combined
     combined = (orb_score * 0.40) + (hash_score * 0.35) + (hist_corr * 0.25)
     
     return {
-        "orb": round(orb_score, 3),
-        "hash": round(hash_score, 3),
-        "color": round(hist_corr, 3),
+        "orb": round(orb_score * 100, 1),
+        "hash": round(hash_score * 100, 1),
+        "color": round(hist_corr * 100, 1),
         "diff_percent": round(diff_percent, 1),
-        "combined": round(combined, 3)
+        "combined": round(combined * 100, 1)
     }
 
 @app.get("/", response_class=HTMLResponse)
@@ -225,7 +219,7 @@ async def home():
             margin: 10px 0 24px;
         }}
         .overall-score {{
-            font-size: 4.2rem;
+            font-size: 4.5rem;
             font-weight: 800;
             background: linear-gradient(90deg, #60a5fa, #a78bfa);
             -webkit-background-clip: text;
@@ -279,7 +273,7 @@ async def home():
             <h1>Video Analyzer</h1>
             <span class="version">{VERSION}</span>
         </div>
-        <p class="subtitle">ORB + ImageHash + Color matching. Better product detection across different scenes.</p>
+        <p class="subtitle">ORB + ImageHash + Color matching. Scores shown as percentages.</p>
         
         <div class="card">
             <form id="form">
@@ -296,7 +290,7 @@ async def home():
                 
                 <div class="controls">
                     <label>Interval <input type="number" name="interval" value="0.5" step="0.1" min="0.2" max="2"> sec</label>
-                    <label>Threshold <input type="number" name="threshold" value="0.35" step="0.05" min="0.15" max="0.65"></label>
+                    <label>Threshold <input type="number" name="threshold" value="35" step="5" min="15" max="65"> %</label>
                 </div>
                 
                 <button type="submit">Analyze Video</button>
@@ -324,28 +318,28 @@ async def home():
             }}
             
             let verdictClass = 'mid';
-            if (data.overall_score >= 0.50) verdictClass = 'high';
-            else if (data.overall_score < 0.30) verdictClass = 'low';
+            if (data.overall_score >= 50) verdictClass = 'high';
+            else if (data.overall_score < 30) verdictClass = 'low';
             
             let rows = data.details.map(d => 
-                `<tr><td>${{d.time}}</td><td>${{d.orb}}</td><td>${{d.hash}}</td><td>${{d.color}}</td><td>${{d.diff_percent}}%</td><td><strong>${{d.combined}}</strong></td></tr>`
+                `<tr><td>${{d.time}}</td><td>${{d.orb}}%</td><td>${{d.hash}}%</td><td>${{d.color}}%</td><td>${{d.diff_percent}}%</td><td><strong>${{d.combined}}%</strong></td></tr>`
             ).join('');
             
             result.innerHTML = `
                 <div class="overall">
-                    <div class="overall-score">${{data.overall_score}}</div>
+                    <div class="overall-score">${{data.overall_score}}%</div>
                     <div class="overall-label">Overall Product Score</div>
                 </div>
                 <div class="verdict ${{verdictClass}}">${{data.verdict}}</div>
                 <div class="metrics">
-                    <div class="metric-card"><div class="value">${{data.avg_orb}}</div><div class="label">ORB</div></div>
-                    <div class="metric-card"><div class="value">${{data.avg_hash}}</div><div class="label">Hash</div></div>
-                    <div class="metric-card"><div class="value">${{data.avg_color}}</div><div class="label">Color</div></div>
+                    <div class="metric-card"><div class="value">${{data.avg_orb}}%</div><div class="label">ORB</div></div>
+                    <div class="metric-card"><div class="value">${{data.avg_hash}}%</div><div class="label">Hash</div></div>
+                    <div class="metric-card"><div class="value">${{data.avg_color}}%</div><div class="label">Color</div></div>
                     <div class="metric-card"><div class="value">${{data.avg_diff}}%</div><div class="label">Diff</div></div>
                     <div class="metric-card"><div class="value">${{data.low_percent}}%</div><div class="label">Flagged</div></div>
                 </div>
                 <div class="note">
-                    <strong>v2.0:</strong> ORB (shape features) + ImageHash (perceptual) + Color. Better at matching products across different scenes.
+                    <strong>v2.1:</strong> Scores are now shown as percentages. ORB + ImageHash + Color matching.
                 </div>
                 <h3 style="margin: 20px 0 8px; color:#cbd5e1;">Frame Details</h3>
                 <table>
@@ -367,7 +361,7 @@ async def analyze(
     video: UploadFile = File(...),
     reference: UploadFile = File(...),
     interval: float = Form(0.5),
-    threshold: float = Form(0.35)
+    threshold: float = Form(35)
 ):
     try:
         video_bytes = await video.read()
@@ -441,22 +435,22 @@ async def analyze(
         avg_diff = float(np.mean(diff_percents))
         low_count = sum(1 for s in combined_scores if s < threshold)
         
-        if overall >= 0.55:
+        if overall >= 55:
             verdict = "GOOD MATCH — product features align"
-        elif overall >= 0.38:
+        elif overall >= 38:
             verdict = "MODERATE MATCH — similar product"
-        elif overall >= 0.25:
+        elif overall >= 25:
             verdict = "PARTIAL MATCH — some similarities"
         else:
             verdict = "POOR MATCH — different product"
         
         return {
-            "overall_score": round(overall, 3),
-            "avg_orb": round(float(np.mean(orb_scores)), 3),
-            "avg_hash": round(float(np.mean(hash_scores)), 3),
-            "avg_color": round(float(np.mean(color_scores)), 3),
-            "min_combined": round(float(np.min(scores)), 3),
-            "max_combined": round(float(np.max(scores)), 3),
+            "overall_score": round(overall, 1),
+            "avg_orb": round(float(np.mean(orb_scores)), 1),
+            "avg_hash": round(float(np.mean(hash_scores)), 1),
+            "avg_color": round(float(np.mean(color_scores)), 1),
+            "min_combined": round(float(np.min(scores)), 1),
+            "max_combined": round(float(np.max(scores)), 1),
             "avg_diff": round(avg_diff, 1),
             "low_percent": round(100 * low_count / len(combined_scores), 1),
             "verdict": verdict,
