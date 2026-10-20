@@ -3,5 +3,6 @@ uvicorn
 opencv-python-headless
 scikit-image
 numpy
+imagehash
 pillow
 python-multipart
