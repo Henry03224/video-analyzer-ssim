@@ -6,35 +6,47 @@ from skimage.metrics import structural_similarity as ssim
 import tempfile
 import os
 
-VERSION = "v1.5.0"
+VERSION = "v1.6.0"
 app = FastAPI(title="Video Analyzer")
 
+def get_product_region(img):
+    """Crop center 60% as product focus area"""
+    h, w = img.shape[:2]
+    margin_h = int(h * 0.20)
+    margin_w = int(w * 0.20)
+    return img[margin_h:h-margin_h, margin_w:w-margin_w]
+
 def compute_metrics(frame, ref):
-    """Practical scoring for product videos"""
-    if frame.shape != ref.shape:
-        frame = cv2.resize(frame, (ref.shape[1], ref.shape[0]), interpolation=cv2.INTER_AREA)
+    """Product-focused comparison"""
+    # Focus on center (product area)
+    frame_prod = get_product_region(frame)
+    ref_prod = get_product_region(ref)
     
-    gray1 = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray2 = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY)
+    # Resize to match
+    if frame_prod.shape != ref_prod.shape:
+        frame_prod = cv2.resize(frame_prod, (ref_prod.shape[1], ref_prod.shape[0]), interpolation=cv2.INTER_AREA)
     
-    # SSIM
+    gray1 = cv2.cvtColor(frame_prod, cv2.COLOR_BGR2GRAY)
+    gray2 = cv2.cvtColor(ref_prod, cv2.COLOR_BGR2GRAY)
+    
+    # SSIM on product area
     ssim_score = float(ssim(gray1, gray2, data_range=255))
     
-    # Histogram
-    hist1 = cv2.calcHist([frame], [0,1,2], None, [8,8,8], [0,256]*3)
-    hist2 = cv2.calcHist([ref], [0,1,2], None, [8,8,8], [0,256]*3)
+    # Histogram on product area
+    hist1 = cv2.calcHist([frame_prod], [0,1,2], None, [8,8,8], [0,256]*3)
+    hist2 = cv2.calcHist([ref_prod], [0,1,2], None, [8,8,8], [0,256]*3)
     cv2.normalize(hist1, hist1, 0, 1, cv2.NORM_MINMAX)
     cv2.normalize(hist2, hist2, 0, 1, cv2.NORM_MINMAX)
     hist_corr = float(cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL))
     hist_score = max(0.0, hist_corr)
     
-    # Diff with higher threshold (ignore small lighting differences)
+    # Diff on product area
     diff = cv2.absdiff(gray1, gray2)
-    _, thresh = cv2.threshold(diff, 60, 255, cv2.THRESH_BINARY)
+    _, thresh = cv2.threshold(diff, 50, 255, cv2.THRESH_BINARY)
     diff_percent = float(np.sum(thresh > 0) / thresh.size * 100)
     
-    # Combined - prioritize SSIM and histogram
-    combined = (ssim_score * 0.65) + (hist_score * 0.35)
+    # Combined (product-focused)
+    combined = (ssim_score * 0.60) + (hist_score * 0.40)
     
     return {
         "ssim": round(ssim_score, 3),
@@ -140,6 +152,18 @@ async def home():
             box-shadow: 0 10px 25px -5px rgba(59, 130, 246, 0.4);
         }}
         #result {{ display: none; margin-top: 8px; }}
+        .overall {{
+            text-align: center;
+            margin: 10px 0 24px;
+        }}
+        .overall-score {{
+            font-size: 4rem;
+            font-weight: 800;
+            background: linear-gradient(90deg, #60a5fa, #a78bfa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }}
+        .overall-label {{ color: #94a3b8; font-size: 0.9rem; margin-top: 4px; }}
         .metrics {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
@@ -153,7 +177,7 @@ async def home():
             text-align: center;
             border: 1px solid #334155;
         }}
-        .metric-card .value {{ font-size: 1.7rem; font-weight: 700; color: #60a5fa; }}
+        .metric-card .value {{ font-size: 1.6rem; font-weight: 700; color: #60a5fa; }}
         .metric-card .label {{ font-size: 0.75rem; color: #94a3b8; margin-top: 4px; }}
         .verdict {{
             padding: 16px;
@@ -187,7 +211,7 @@ async def home():
             <h1>Video Analyzer</h1>
             <span class="version">{VERSION}</span>
         </div>
-        <p class="subtitle">Detect significant changes (text, objects) while ignoring minor lighting differences.</p>
+        <p class="subtitle">Product-focused comparison. Ignores background and focuses on the center area.</p>
         
         <div class="card">
             <form id="form">
@@ -204,7 +228,7 @@ async def home():
                 
                 <div class="controls">
                     <label>Interval <input type="number" name="interval" value="0.5" step="0.1" min="0.2" max="2"> sec</label>
-                    <label>Threshold <input type="number" name="threshold" value="0.40" step="0.05" min="0.2" max="0.75"></label>
+                    <label>Threshold <input type="number" name="threshold" value="0.45" step="0.05" min="0.2" max="0.75"></label>
                 </div>
                 
                 <button type="submit">Analyze Video</button>
@@ -219,7 +243,7 @@ async def home():
         e.preventDefault();
         const result = document.getElementById('result');
         result.style.display = 'block';
-        result.innerHTML = '<p style="text-align:center; color:#94a3b8;">Analyzing... This may take 15-40 seconds</p>';
+        result.innerHTML = '<p style="text-align:center; color:#94a3b8;">Analyzing product area... This may take 15-40 seconds</p>';
         
         const formData = new FormData(e.target);
         try {{
@@ -232,28 +256,31 @@ async def home():
             }}
             
             let verdictClass = 'mid';
-            if (data.avg_combined >= 0.55) verdictClass = 'high';
-            else if (data.avg_combined < 0.35) verdictClass = 'low';
+            if (data.overall_score >= 0.60) verdictClass = 'high';
+            else if (data.overall_score < 0.40) verdictClass = 'low';
             
             let rows = data.details.map(d => 
                 `<tr><td>${{d.time}}</td><td>${{d.ssim}}</td><td>${{d.hist}}</td><td>${{d.diff_percent}}%</td><td><strong>${{d.combined}}</strong></td></tr>`
             ).join('');
             
             result.innerHTML = `
-                <div class="metrics">
-                    <div class="metric-card"><div class="value">${{data.avg_combined}}</div><div class="label">Avg Combined</div></div>
-                    <div class="metric-card"><div class="value">${{data.min_combined}}</div><div class="label">Minimum</div></div>
-                    <div class="metric-card"><div class="value">${{data.max_combined}}</div><div class="label">Maximum</div></div>
-                    <div class="metric-card"><div class="value">${{data.avg_diff}}%</div><div class="label">Avg Diff Area</div></div>
-                    <div class="metric-card"><div class="value">${{data.low_percent}}%</div><div class="label">Flagged</div></div>
+                <div class="overall">
+                    <div class="overall-score">${{data.overall_score}}</div>
+                    <div class="overall-label">Overall Product Score</div>
                 </div>
                 <div class="verdict ${{verdictClass}}">${{data.verdict}}</div>
-                <div class="note">
-                    <strong>Tip:</strong> Diff Area ignores small lighting/angle differences. Focus on high Diff % for text or object changes.
+                <div class="metrics">
+                    <div class="metric-card"><div class="value">${{data.min_combined}}</div><div class="label">Min Score</div></div>
+                    <div class="metric-card"><div class="value">${{data.max_combined}}</div><div class="label">Max Score</div></div>
+                    <div class="metric-card"><div class="value">${{data.avg_diff}}%</div><div class="label">Diff Area</div></div>
+                    <div class="metric-card"><div class="value">${{data.low_percent}}%</div><div class="label">Flagged</div></div>
                 </div>
-                <h3 style="margin: 20px 0 8px; color:#cbd5e1;">Frame Scores</h3>
+                <div class="note">
+                    <strong>Product Focus:</strong> Comparison is done on the center 60% of the frame where products usually appear.
+                </div>
+                <h3 style="margin: 20px 0 8px; color:#cbd5e1;">Frame Details</h3>
                 <table>
-                    <thead><tr><th>Time</th><th>SSIM</th><th>Hist</th><th>Diff %</th><th>Combined</th></tr></thead>
+                    <thead><tr><th>Time</th><th>SSIM</th><th>Hist</th><th>Diff %</th><th>Score</th></tr></thead>
                     <tbody>${{rows}}</tbody>
                 </table>
             `;
@@ -271,7 +298,7 @@ async def analyze(
     video: UploadFile = File(...),
     reference: UploadFile = File(...),
     interval: float = Form(0.5),
-    threshold: float = Form(0.40)
+    threshold: float = Form(0.45)
 ):
     try:
         video_bytes = await video.read()
@@ -334,22 +361,22 @@ async def analyze(
             return JSONResponse({"error": "No frames analyzed"})
         
         scores = np.array(combined_scores)
-        avg = float(np.mean(scores))
+        overall = float(np.mean(scores))
         avg_diff = float(np.mean(diff_percents))
         low_count = sum(1 for s in combined_scores if s < threshold)
         
-        # Practical verdict
-        if avg >= 0.60:
-            verdict = "SIMILAR — minor differences only"
-        elif avg >= 0.40:
-            verdict = "MODERATE DIFFERENCES"
-        elif avg_diff > 25:
-            verdict = "SIGNIFICANT CHANGES DETECTED"
+        # Overall score verdict
+        if overall >= 0.65:
+            verdict = "HIGH MATCH — product looks consistent"
+        elif overall >= 0.45:
+            verdict = "MODERATE MATCH — some differences detected"
+        elif overall >= 0.30:
+            verdict = "LOW MATCH — significant changes possible"
         else:
-            verdict = "DIFFERENT CONTENT"
+            verdict = "POOR MATCH — product differs significantly"
         
         return {
-            "avg_combined": round(avg, 3),
+            "overall_score": round(overall, 3),
             "min_combined": round(float(np.min(scores)), 3),
             "max_combined": round(float(np.max(scores)), 3),
             "avg_diff": round(avg_diff, 1),
